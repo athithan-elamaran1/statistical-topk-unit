@@ -1,0 +1,78 @@
+statistical-topk-unit -- fixed-point design analysis
+model: sim/topk_model.py (bit-exact vs RTL)
+
+========================================================================
+1. Keep rate vs alpha  (Gaussian input mu=80 sigma=25, 60k samples)
+========================================================================
+alpha_reg  alpha  measured  gaussian theory
+        3   0.75   23.24%          22.66%
+        4   1.00   16.25%          15.87%
+        5   1.25   10.97%          10.56%
+        6   1.50    7.07%           6.68%
+        7   1.75    4.25%           4.01%
+        8   2.00    2.43%           2.28%
+        9   2.25    1.39%           1.22%
+       10   2.50    0.74%           0.62%
+
+The measured rates track the one-sided Gaussian tail closely; the
+small excess at high alpha comes from EMA estimator noise (the
+threshold wobbles ~2 LSB around truth, and the tail is convex).
+
+========================================================================
+2. Warmup convergence (threshold vs sample count, 20 trials)
+========================================================================
+true threshold = mu + 1.5*sigma = 117.5
+ samples  mean |thr error|
+       8             15.01
+      16              8.23
+      32              5.49
+      48              4.67
+      64              4.07
+      96              3.73
+     128              2.79
+     192              2.47
+     256              2.12
+     512              2.27
+
+Error plateaus by ~64 samples (further samples reduce error only
+marginally, limited by the EMA noise floor) -> warmup N = 64 and
+EMA window 2^6 = 64 are hardened as the reset defaults (sel=2).
+
+========================================================================
+3. Distribution-shift adaptation (mu: 60 -> 120 at sample 5000)
+========================================================================
+ sample  threshold   (target after shift: 150)
+   5000       86.9
+   5065      151.1
+   5129      157.1
+   5257      152.1
+   5513      151.1
+  10000      148.4
+
+The threshold re-converges within a few EMA windows (~200-500
+samples) of the shift with no reset and no recalibration pass --
+the live-adaptation behavior the demo shows on prompt changes.
+
+========================================================================
+4. Fixed-point vs float Welford (time-averaged, 60k samples)
+========================================================================
+float Welford : mean=  80.021  var=  623.887
+fixed (avg)   : mean=  79.885  var=  619.292
+error         : mean=   0.136  var=    4.595
+
+Sub-LSB mean bias (floor-truncation of the shift, bounded by
+(2^s-1)/2 raw Q8.8 units ~ 0.12) and a few percent variance bias
+(EMA weighting factor 2/(2-lambda) ~ 1.008 plus truncation).
+
+========================================================================
+5. ReLU-style FFN activations (ReLU(N(0,60)), alpha sweep 1.0-2.0)
+========================================================================
+alpha_reg=4 (alpha=1.00): keep rate = 16.52%
+alpha_reg=5 (alpha=1.25): keep rate = 13.23%
+alpha_reg=6 (alpha=1.50): keep rate = 10.34%
+alpha_reg=7 (alpha=1.75): keep rate = 8.07%
+alpha_reg=8 (alpha=2.00): keep rate = 6.29%
+
+On half-rectified activations the Gaussian fit is approximate by
+design (this is the Spark Transformer premise); alpha in 5..7
+brackets the paper's ~8% operating point.

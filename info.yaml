@@ -1,0 +1,61 @@
+# Tiny Tapeout project information
+project:
+  title:        "Statistical Top-K Unit"
+  author:       "Athithan Elamaran"
+  discord:      ""
+  description:  "Sort-free O(N) statistical top-k for transformer FFN activation sparsity (Spark Transformer primitive): online Welford mean/variance + Gaussian-tail keep/skip gate"
+  language:     "Verilog"
+  clock_hz:     25000000
+
+  # How many tiles your design occupies? A single tile is about 167x108 uM.
+  # Serial-MAC design: 2,062 generic gates (our earlier parallel-multiplier
+  # version was 4,832 gates and needed 2x2 tiles).
+  tiles: "1x2"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
+
+  # Your top module name must start with "tt_um_". Make it unique by including your github username:
+  top_module:  "tt_um_statistical_topk"
+
+  # List your project's source files here.
+  # Source files must be in ./src and you must list each source file separately, one per line.
+  # Don't forget to also update `PROJECT_SOURCES` in test/Makefile.
+  source_files:
+    - "tt_um_statistical_topk.v"
+    - "welford_unit.v"
+    - "topk_selector.v"
+    - "serial_mac.v"
+
+# The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
+# This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
+pinout:
+  # Inputs
+  ui[0]: "ACT0 (activation bit 0, LSB)"
+  ui[1]: "ACT1"
+  ui[2]: "ACT2"
+  ui[3]: "ACT3"
+  ui[4]: "ACT4"
+  ui[5]: "ACT5"
+  ui[6]: "ACT6"
+  ui[7]: "ACT7 (activation bit 7, MSB)"
+
+  # Outputs
+  uo[0]: "KEEP (1 = keep activation, 0 = skip)"
+  uo[1]: "OUT_VALID (1-cycle pulse qualifying KEEP)"
+  uo[2]: "WARMUP (statistics still warming up)"
+  uo[3]: "CLAMP (defensive overflow flag, 0 in normal operation)"
+  uo[4]: "KEEP_CNT0 (keep counter bit 0)"
+  uo[5]: "KEEP_CNT1"
+  uo[6]: "KEEP_CNT2"
+  uo[7]: "KEEP_CNT3 (keep counter bit 3)"
+
+  # Bidirectional pins
+  uio[0]: "IN_VALID (input; rising edge samples ACT[7:0])"
+  uio[1]: "CFG_WE (input; rising edge latches CFG pins)"
+  uio[2]: "CFG_ALPHA0 (input; threshold gain alpha = value/4)"
+  uio[3]: "CFG_ALPHA1 (input)"
+  uio[4]: "CFG_ALPHA2 (input)"
+  uio[5]: "CFG_ALPHA3 (input)"
+  uio[6]: "CFG_WARMUP0 (input; warmup length N = 16 << value)"
+  uio[7]: "CFG_WARMUP1 (input)"
+
+# Do not change!
+yaml_version: 6

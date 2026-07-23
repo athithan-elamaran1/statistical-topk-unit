@@ -1,0 +1,923 @@
+================================================================================
+ARCHITECTURE.txt -- statistical-topk-unit
+A complete technical description of the design: the algorithm, every
+architectural decision, every bit width (with proofs), every Verilog module
+line by line, the verification methodology, and the results.
+
+This document describes v2 (serial-MAC, 1x2 tiles). An earlier version of
+this design (v1: parallel shared multiplier, 2x2 tiles) is referenced
+throughout for comparison; section 14 tells the v1 -> v2 story with the
+measured numbers that drove the redesign.
+================================================================================
+
+CONTENTS
+  1.  What this chip does and why
+  2.  The algorithm, from paper math to shift-and-compare hardware
+  3.  Number formats and bit-width derivations (with overflow proofs)
+  4.  The variance-space threshold: eliminating the square root exactly
+  5.  The gain schedule: Welford with power-of-2 divisions
+  6.  Microarchitecture: one serial MAC, a nine-state sequencer, 57 clocks
+  7.  Verilog walkthrough: serial_mac.v
+  8.  Verilog walkthrough: welford_unit.v
+  9.  Verilog walkthrough: topk_selector.v
+  10. Verilog walkthrough: tt_um_statistical_topk.v (top / pin interface)
+  11. Interface protocols (sample strobe, config writes, output semantics)
+  12. Verification: golden model, cocotb suite, and two bugs it caught
+  13. Simulation results (keep rates, warmup, adaptation, fixed-point error)
+  14. Synthesis results, the v1 -> v2 area story, and the tile budget
+  15. Design decisions and alternatives considered
+  16. The demo pipeline
+  17. References
+
+
+================================================================================
+1. WHAT THIS CHIP DOES AND WHY
+================================================================================
+
+The Spark Transformer paper (Google DeepMind, NeurIPS 2025, arXiv:2506.06644)
+documents the "lazy neuron" phenomenon: in fully trained transformers only
+~8% of FFN neurons produce a significant activation for any given token.
+Exploiting that sparsity (skip the ~92% of downstream multiply-accumulates
+attached to near-zero activations) yields a 2.5x FLOPs reduction and up to
+1.79x wall-clock decode speedup -- but only if you can IDENTIFY the top ~8%
+of activations quickly. Standard top-k selection sorts or partially sorts
+the activation vector: O(N log N) comparisons, a priority-encoder-shaped
+structure that maps terribly onto accelerator hardware; the paper measures
+up to 10x training slowdown from conventional top-k on TPUs.
+
+The paper's algorithmic fix is STATISTICAL top-k: fit a Gaussian to the
+activation distribution online, then keep activation x iff
+
+    x > mean + alpha * sigma                                        (1)
+
+This replaces global selection with a purely local test: one comparison per
+activation, O(N) total, no sorting network, no priority encoder, no offline
+calibration pass. alpha sets the sparsity target (alpha = 1.5 keeps the top
+~6.7% of a Gaussian; ~8% on realistic post-ReLU FFN distributions needs
+alpha ~ 1.75, see section 13).
+
+This chip is that primitive in silicon: it ingests a stream of 8-bit
+quantized activations, learns mean and variance online, and emits a 1-bit
+keep/skip decision per activation, with live-reconfigurable sparsity. One
+Verilog design, two submodules connected by plain wires, one multiplier in
+the whole chip, submitted as a 1x2-tile Tiny Tapeout project on the
+SkyWater 130nm open PDK.
+
+    activations ----> [ welford_unit ] --mean, products--> [ topk_selector ]
+       8b/sample        online stats +      wires             keep/skip gate
+                        [ serial_mac ]                        (no arithmetic
+                        the ONE multiply                       heavier than
+                        engine (no divider,                    an increment)
+                        no sqrt, no array)
+
+
+================================================================================
+2. THE ALGORITHM, FROM PAPER MATH TO SHIFT-AND-COMPARE HARDWARE
+================================================================================
+
+Four transformations take equation (1) from textbook statistics to a
+hardware datapath whose only arithmetic blocks are adders, shifters, a
+comparator, and one serial multiply engine:
+
+  (a) ONLINE MOMENTS, NOT STORED HISTORY. Welford's incremental update
+      maintains mean and variance in O(1) state per sample -- no activation
+      buffer. Section 5 details the exact update used.
+
+  (b) POWER-OF-2 GAINS, NOT DIVISION. Welford's textbook form divides by
+      the sample count n. We restrict every divisor to a power of two, so
+      each division is an arithmetic right shift (zero gates beyond wiring).
+      The shift schedule reproduces an expanding-window average during
+      warmup and an exponential moving average (EMA) afterwards.
+
+  (c) VARIANCE SPACE, NOT SIGMA. Equation (1) needs sigma = sqrt(var).
+      Squaring both sides eliminates the sqrt EXACTLY (section 4). The
+      biggest, slowest block a naive implementation would need -- an integer
+      square root -- vanishes.
+
+  (d) ONE SERIAL MULTIPLIER, NOT PARALLEL ARRAYS. After (a)-(c), three
+      products per sample remain: alpha^2 * var, delta * delta2 (the
+      Welford M2 increment), and dx^2 (the decision left-hand side). All
+      three are funneled through a single radix-2 serial MAC -- one 25-bit
+      adder and a 41-bit shift register replace every partial-product
+      array in the design (section 6). Silicon area is what this chip
+      exists to economize; cycles are abundant (the input link's byte
+      period, 83 clocks, is ~46% longer than even the serialized
+      pipeline's 57).
+
+What remains per sample: two subtractions, two shifted adds, three passes
+through the serial MAC, and one 41-bit compare. That is the entire primitive.
+
+
+================================================================================
+3. NUMBER FORMATS AND BIT-WIDTH DERIVATIONS
+================================================================================
+
+  signal    width  format  range                justification
+  --------  -----  ------  -------------------  --------------------------------
+  x         8      uint8   0..255               quantized FFN activation (input)
+  mean      16     Q8.8    0..65280 (proof P1)  8 int bits cover 0..255, 8 frac
+                                                bits keep quantization error of
+                                                the EMA under 1/256 of an LSB
+                                                of x per update
+  delta     18     signed  -65280..65280        (x<<8) - mean; 17 bits magnitude
+            (Q9.8)                              + sign; declared 18 for headroom
+  |delta|,  17     u17     0..65280             magnitudes fed to the unsigned
+  |delta2|                                      serial MAC (licensed by proof P2:
+                                                the two deviations share a sign)
+  var       24     Q16.8   0..16646400 (P3)     max possible variance of values
+                                                in [0,255] is 127.5^2 = 16256.25
+                                                -> 14 int bits of "real" range;
+                                                16 int bits cover the update
+                                                term's transient maximum too
+  MAC m     24     u24     multiplicand         var (24b) or a zero-extended
+                                                magnitude (17b)
+  MAC q     17     u17     multiplier           a magnitude, or alpha^2 (8b ext)
+  MAC p     41     u41     m*q < 2^41           the combined product register;
+                                                every product actually fits
+                                                2^33 (see per-op bounds below)
+  alpha     4      u4      0..15                alpha_real = alpha/4: 0..3.75 in
+                                                0.25 steps; covers keep rates
+                                                ~40% down to ~0.01% (Gaussian)
+  alpha_sq  8      u8      0..225               alpha*alpha, computed
+                                                combinationally (4x4 mult --
+                                                the one "parallel multiply"
+                                                left, a handful of gates)
+  rhs_r     32     u32     alpha^2*var < 2^32   latched RHS product
+  lhs/rhs   41     u41     <= 2^37 / < 2^40     compare operands, exact scaling
+  n         8      u8      0..255 saturating    only consulted for warmup
+                                                compare (< 128 max) and the
+                                                shift schedule (caps at K<=7),
+                                                so saturation at 255 is lossless
+  keep_cnt  16     u16     wraps                monitoring counter; low nibble
+                                                is pinned out
+  index     16     u16     wraps                stream position (sparse index)
+
+Per-op product bounds through the MAC:
+  alpha^2 * var    <= 225 * 16,777,215     = 3,774,873,375  < 2^32
+  delta * delta2   <= 65,280^2             = 4,261,478,400  < 2^32
+  dx^2             <= 65,280^2             = 4,261,478,400  < 2^32
+All three fit 32 bits; the 41-bit register width is the structural
+m-width + q-width of the shift-add algorithm, not a data requirement --
+the upper bits are provably zero and sunk into lint-clean unused wires.
+
+PROOF P1 (mean stays in [0, 65280], so 16-bit unsigned Q8.8 never overflows):
+  mean' = mean + floor(delta / 2^s),  delta = (x<<8) - mean.
+  Upper bound: if delta > 0 then mean' <= mean + delta = x<<8 <= 65280.
+  If delta <= 0, mean' <= mean <= 65280 by induction.
+  Lower bound: if delta < 0, floor(delta/2^s) >= -mean for any s >= 0
+  (because delta >= -mean and floor(-m/2^s) >= -m for all integers m >= 0),
+  so mean' >= 0. If delta >= 0, mean' >= mean >= 0.                      QED
+
+PROOF P2 (the Welford product delta*delta2 is always >= 0 -- "no overshoot"):
+  delta2 = (x<<8) - mean' = delta - floor(delta / 2^s).
+  Case s = 0 (first sample): mean' = x<<8 exactly, delta2 = 0, product 0.
+  Case s >= 1, delta >= 0: floor(delta/2^s) <= delta/2, so
+    delta2 >= delta/2 >= 0: same sign.
+  Case s >= 1, delta < 0: floor can subtract at most 1 below the exact
+    quotient, so delta2 <= delta - (delta/2 - 1) = delta/2 + 1 <= 0 for
+    delta <= -2, and for delta = -1, floor(-1/2^s) = -1 gives delta2 = 0.
+  In every case delta and delta2 share a sign (or delta2 = 0), so
+  prod = delta * delta2 >= 0.                                            QED
+  Corollary 1: no signed-negative path exists into the variance register.
+  Corollary 2: |delta| * |delta2| = delta * delta2 exactly -- which is what
+  licenses feeding the UNSIGNED serial MAC with magnitudes and dropping
+  all sign-extension logic from the multiply loop.
+
+PROOF P3 (variance update term fits 24 bits):
+  term = floor(prod / 2^8) <= floor(65280^2 / 256) = 16,646,400 < 2^24 - 1
+  = 16,777,215. The update var' = var + floor((term - var)/2^s) is a convex
+  combination (up to floor error <= 1) of var and term, both < 2^24, and the
+  floor error cannot push it past max(var, term):
+    if term >= var: var' <= var + (term - var) = term < 2^24.
+    if term <  var: var' <= var < 2^24 (the increment is <= 0).
+  Hence the 24-bit variance register cannot legitimately overflow.       QED
+
+  The RTL still carries an overflow/underflow clamp with a sticky status
+  flag (uo[3]). It is DEFENSIVE hardening -- reachable only through
+  radiation upset or X-propagation, never through data. The original plan
+  called for "overflow detection and renormalization"; the proofs above
+  make renormalization unnecessary, which is a strictly stronger result
+  than handling overflow: the design cannot produce it.
+
+Why the M2-accumulator formulation from the original plan changed: a true
+32-bit M2 running sum overflows after 65,536 samples (65025 * 65536 =
+4.26e9, within a hair of 2^32) and requires either renormalization events
+or a hard stream-length limit. The EMA formulation stores the VARIANCE
+(bounded by data, 24 bits, proof P3) rather than the unbounded SUM, runs
+forever, and adapts to distribution shift -- which the demo exploits. The
+32-vs-24-bit accumulator analysis from the plan survives as proof P3's
+bound on the transient update term.
+
+
+================================================================================
+4. THE VARIANCE-SPACE THRESHOLD: ELIMINATING THE SQRT EXACTLY
+================================================================================
+
+Naive implementation of (1): sigma = sqrt(var), threshold = mean + alpha *
+sigma, compare x > threshold. Integer sqrt is the most expensive block that
+would exist in this design (iterative restoring root: ~400 cells and a long
+carry chain, or many cycles).
+
+Instead square the condition. With dx = x - mean:
+
+    x > mean + alpha*sigma   <=>   dx > 0  AND  dx^2 > alpha^2 * var    (2)
+
+The right form is exact, not an approximation: for dx > 0 both sides of the
+squaring are non-negative, and squaring is monotonic on non-negatives. The
+dx > 0 guard restores the sign information squaring destroys (a large
+NEGATIVE deviation also has a large square, but belongs to the lower tail
+and must be skipped).
+
+In fixed point, with dxq = (x<<8) - mean (Q9.8), var in Q16.8, and
+alpha_real = alpha/4:
+
+    dxq^2            = dx^2 * 2^16
+    var << 8         = var_real * 2^16
+    alpha_real^2     = alpha^2 / 16
+
+    (2)  <=>  dxq^2 > (alpha^2 / 16) * (var << 8)
+         <=>  16 * dxq^2 > alpha^2 * (var << 8)                          (3)
+
+Every term in (3) is an integer; multiplying through by 16 clears the only
+fraction. The hardware comparison is therefore EXACT -- the chip's keep
+decision is bit-identical to infinite-precision evaluation of (2) on the
+Q8.8/Q16.8 state. Widths: 16*dxq^2 <= 16 * 65280^2 < 2^37; alpha^2 *
+(var<<8) <= 225 * (2^24-1)*256 < 2^40. Both sides sit in 41-bit compare
+operands with the shifts applied as wiring (zero gates).
+
+Cost accounting: the sqrt block is gone; the price is one extra pass
+through the serial MAC (alpha^2 * var) and a 41-bit compare. Zero accuracy
+loss.
+
+
+================================================================================
+5. THE GAIN SCHEDULE: WELFORD WITH POWER-OF-2 DIVISIONS
+================================================================================
+
+Textbook Welford (exact, any n):
+    delta  = x - mean
+    mean' = mean + delta / n              <- arbitrary division
+    delta2 = x - mean'
+    M2'   = M2 + delta * delta2
+    var    = M2 / n                        <- arbitrary division
+
+Divisions by arbitrary n need a divider. This design replaces 1/n with a
+power-of-2 gain 2^-s under the schedule
+
+    s = min(bitlength(n), K)         n = samples processed so far
+                                     K = 4 + warmup_sel  (4..7)
+
+where bitlength(n) is the position of n's highest set bit (bitlength(0)=0).
+The per-sample update becomes:
+
+    delta  = (x<<8) - mean
+    mean' = mean + (delta >>> s)                       [arith shift]
+    delta2 = (x<<8) - mean'
+    var'  = var + (((delta * delta2) >>> 8) - var) >>> s
+
+Behavior of the schedule:
+  n = 0:      s = 0, gain 1      -> mean' = x exactly (cold-start load;
+                                    delta2 = 0 so var stays 0)
+  n = 1:      s = 1, gain 1/2
+  n = 2,3:    s = 2, gain 1/4
+  n = 4..7:   s = 3, gain 1/8
+  ...                            -> gain ~ 1/n: an expanding-window average,
+                                    exactly the "division restricted to
+                                    power-of-2 batch sizes" idea -- the
+                                    divisor doubles at each power-of-2 count
+  n >= 2^K:   s = K, gain 2^-K   -> exponential moving average, window 2^K
+
+So a single 3-bit shift-amount signal morphs the estimator from "true
+Welford-style expanding average" (during warmup, when convergence speed
+matters) into "EMA" (in steady state, when tracking a drifting distribution
+matters). The var update uses the same delta*delta2 increment as Welford's
+M2 -- this is Welford's algorithm with exponential forgetting, not a
+different estimator bolted on.
+
+Accuracy (measured, section 13): steady-state mean bias ~0.14 LSB of x
+(floor-truncation bias, bounded by (2^s - 1)/2 Q8.8 units = 0.123 real);
+variance bias under 1% (EMA weighting factor 2/(2 - 2^-K) = 1.008 at K=6,
+plus truncation). Estimator noise, not bias, dominates the threshold error
+(~2 LSB wobble at K=6), which is why alpha keep rates land within ~0.4
+percentage points of Gaussian theory.
+
+The warmup register couples N = 16<<sel to K = 4+sel {16/32/64/128 samples,
+window 16/32/64/128}: the averaging window always equals the warmup length,
+so "statistics are declared reliable" exactly when the estimator has one
+full window of data. During warmup the selector force-keeps everything
+(conservative: never drop an activation on immature statistics); the
+Python analysis (section 13) shows the threshold error plateaus at ~64
+samples, hence the reset default sel = 2.
+
+Truncation semantics, pinned down because both sides must match bit-exactly:
+every shift is an ARITHMETIC right shift on a signed value, i.e. floor
+division by 2^s (rounds toward -infinity). Python's >> on negative ints has
+identical semantics to Verilog's >>> on signed two's-complement values --
+the golden model and the RTL share floor semantics by construction.
+(Section 12 describes the one place v2 briefly violated this rule and how
+the bit-exact suite caught it within seconds.)
+
+
+================================================================================
+6. MICROARCHITECTURE: ONE SERIAL MAC, A NINE-STATE SEQUENCER, 57 CLOCKS
+================================================================================
+
+v2's organizing principle: SILICON AREA IS THE SCARCE RESOURCE, CYCLES ARE
+NOT. The chip's input link (3 Mbaud UART, ~83 clocks/byte at 25 MHz) is
+slower than even a fully serialized datapath, so every parallel multiplier
+is waste. The design therefore contains exactly one multiply engine -- a
+radix-2 serial MAC (section 7) -- and a nine-state sequencer that funnels
+the three products each sample needs through it:
+
+  #  product              m (multiplicand)   q (multiplier)     used for
+  -  -------------------  -----------------  -----------------  -----------
+  1  alpha^2 * variance   variance (24b)     alpha^2 (8b ext)   decision RHS
+  2  delta * delta2       |delta2| (17b ext) |delta| (17b)      M2 increment
+  3  dx^2                 |delta| (17b ext)  |delta| (17b)      decision LHS
+
+The ORDER is chosen so that (a) every product that feeds the decision reads
+PRE-update state (predict-then-update semantics), and (b) the last product
+(dx^2) is still sitting in the MAC's product register at decision time --
+eliminating the 40-bit LHS holding register v1 needed:
+
+  state      cycles  what happens
+  ---------  ------  -----------------------------------------------------
+  S_IDLE       1     accept sample on in_valid edge; latch x
+  S_DEC        1     latch delta = (x<<8) - mean and |delta|; selector
+                     snapshots dx sign + warmup flag (all PRE-update);
+                     MAC starts product #1 (variance is pre-update here)
+  S_RHS       17     MAC iterates
+  S_MEAN       1     mean <= mean + (delta >>> s); latch delta2, |delta2|;
+                     selector latches product #1 from the MAC (rhs_ld)
+  S_PROD_GO    1     MAC starts product #2 (|delta2| was latched last edge)
+  S_PROD      17     MAC iterates
+  S_VAR        1     var <= var + (((prod) >>> 8) - var) >>> s, read
+                     directly from the MAC product register; n++;
+                     MAC starts product #3 in the same cycle
+  S_SQ        17     MAC iterates
+  S_OUT        1     selector compares {dx^2,<<4} vs {rhs,<<8} straight
+                     from the MAC register, registers keep, pulses
+                     out_valid the next cycle
+  ---------  ------
+  total       57     fixed latency, in_valid edge -> out_valid pulse
+
+Throughput: 57 clocks/sample = ~430k decisions/s at 25 MHz -- ~1.4x ahead
+of a saturated 3 Mbaud UART. The serialization costs a latency the system
+literally cannot observe (the next UART byte is still ~26 clocks away when
+the decision emerges).
+
+Predict-then-update ordering: the decision for sample x uses the statistics
+BEFORE x is folded in: product #1 launches in S_DEC while variance is
+untouched, the dx sign latches against the pre-update mean, and dx^2 is a
+function of delta -- also latched pre-update. The mean/var updates land
+mid-pass (S_MEAN, S_VAR) without disturbing any decision input. x never
+influences its own threshold.
+
+Why an FSM and not a pipeline: with a 57-cycle occupancy per sample and an
+83-cycle input period, overlapping samples buys nothing. The FSM keeps each
+pass atomic -- zero hazards by construction -- and lets one MAC serve every
+product. (v1 made the same argument at 4 cycles/sample with one parallel
+multiplier; v2 pushes it to its conclusion.)
+
+
+================================================================================
+7. VERILOG WALKTHROUGH: serial_mac.v
+================================================================================
+
+The design's single multiply engine: an unsigned radix-2 sequential
+multiplier in the classic "combined product/multiplier register" form.
+
+Ports:
+  start        1-cycle pulse: latch m (24b) and q (17b), begin iterating
+  busy         high for the 17 iteration cycles
+  done         pulse during the final iteration cycle (cnt == 1); the
+               completed product is readable from the NEXT cycle onward
+  p[40:0]      the product register; holds its value from completion until
+               the next start -- callers exploit this as free storage
+
+The algorithm (one 25-bit adder, one 41-bit register, no partial products):
+
+  r = {acc[23:0], q[16:0]}                  41 bits, loaded {24'0, q}
+  each cycle:
+    sum[24:0] = acc + (r[0] ? m : 0)        the ONLY adder; carry kept
+    r         = {sum, r[16:1]}              shift right absorbs the carry
+
+  after 17 cycles: p = r
+
+Why this shape: each iteration examines the multiplier's LSB (r[0]),
+conditionally adds the multiplicand into the accumulator field, and shifts
+the whole register right -- consuming one multiplier bit while aligning the
+partial sum. The accumulator field is READ as 24 bits and WRITTEN as 25
+(the add's carry), with the shift-right reabsorbing the extra bit -- the
+register never grows. A worked 2-bit example (3 x 3):
+
+  load       r = {00, 11}
+  it 1: sum = 00 + 11 = 011; r = {011, 1} = 0111
+  it 2: sum = 01 + 11 = 100; r = {100, 1} = 1001 = 9  ✓
+
+Iteration count is FIXED at 17 (the q width), even when q is the 8-bit
+alpha^2: 9 wasted cycles buys a sequencer with no per-op cycle counts and
+a fully deterministic 57-cycle sample latency. The unit is verified
+standalone by test/tb_mac.v (directed corner products including 65280^2
+and (2^24-1)*225, plus 500 random pairs, self-checking) in addition to
+riding along in every system-level test.
+
+Unsignedness is a feature: callers pass magnitudes, licensed by proof P2
+(the two Welford deviations always share a sign, so |delta| * |delta2| =
+delta * delta2 exactly), and the iteration loop carries no sign-extension
+logic at all.
+
+
+================================================================================
+8. VERILOG WALKTHROUGH: welford_unit.v
+================================================================================
+
+Ports:
+  clk, rst_n       25 MHz clock; synchronous active-low reset (synchronous
+                   because TT gate-level netlists + sky130 DFFs behave most
+                   predictably with fully synchronous control, and the reset
+                   tree then needs no recovery/removal analysis)
+  start            1-cycle strobe from the top module (edge-detected
+                   in_valid); ignored unless the FSM is in S_IDLE
+  x[7:0]           activation byte (sampled into x_r on accept)
+  warmup_sel[1:0]  config: N = 16<<sel, K = 4+sel
+  alpha[3:0]       config: the unit computes alpha_sq = alpha*alpha (a 4x4
+                   combinational multiply, ~a dozen gates) for product #1
+  x_r_out[7:0]     the latched sample, stable for the whole pass; the
+                   selector computes its sign test from this
+  mean[15:0]       running mean, Q8.8 -- a plain wire to the selector
+  variance[23:0]   running variance, Q16.8 -- exported for FPGA builds and
+                   debug (the selector no longer consumes it directly; its
+                   alpha^2 * var arrives pre-computed through the MAC)
+  warmup_active    live comparison n < N
+  clamp_sticky     defensive clamp flag (section 3), sticky until reset
+  snap             pulse (S_DEC): selector snapshots dx sign + warmup flag
+  rhs_ld           pulse (S_MEAN): MAC register holds product #1, latch it
+  done             pulse (S_OUT): MAC register holds dx^2, decide now
+  mac_p[40:0]      the shared MAC's product register, exported
+
+Internal state: the FSM state (4b), x_r, the saturating counter n, delta_r
+(signed Q9.8), and the two MAC-operand magnitudes da_r = |delta| and
+dm2_r = |delta2| (17b each).
+
+Combinational pieces, in source order:
+
+  bitlen(v): an 8-way casez priority encoder returning int.bit_length(v);
+  a few gates, no latches (full casez coverage with default).
+
+  kk = 4 + warmup_sel; s = min(bitlen(n), kk): the gain schedule of
+  section 5. n only changes in S_VAR, so s is stable across each sample's
+  whole pass -- the same s serves the mean update (S_MEAN) and the var
+  update (S_VAR), which the golden model mirrors.
+
+  warmup_n = 16 << warmup_sel; warmup_active = (n < warmup_n). n saturates
+  at 255, above every possible warmup_n, so saturation never falsely
+  re-enters warmup.
+
+  xq, mean_s, delta, mean_next, delta2: the mean datapath, adds and shifts
+  only, identical to v1 (all operands DECLARED signed; see section 12 for
+  why that discipline matters). mean_next is provably in [0, 65280] (P1),
+  so its 16-bit writeback truncation is lossless.
+
+  delta_abs / delta2_abs: 17-bit magnitudes for the MAC. The negation of
+  the 17-bit slice is exact because |delta| <= 65280 < 2^17.
+
+  MAC hookup: mac_start = (state == S_DEC) | (state == S_PROD_GO) |
+  (state == S_VAR) -- each start cycle's operands are selected by a state
+  mux per the section-6 table and latched inside the MAC. Note S_VAR both
+  consumes product #2 (the variance update reads mac_p combinationally)
+  and launches product #3 at the same edge: register semantics guarantee
+  the old product value is read before the load overwrites it.
+
+  Variance update: term = mac_p[33:8] (the >>8 rescale to Q16.8; bounds in
+  section 3 prove bits [40:34] are zero and term < 2^24). Then term_s,
+  var_s, diff, var_upd -- ALL declared signed [27:0] -- implement
+  var + ((term - var) >>> s), followed by the defensive clamp.
+
+The FSM itself (section 6's table) is a single always block, synchronous
+reset covering every register -- gate-level simulation (X everywhere at
+t=0) settles deterministically after reset.
+
+
+================================================================================
+9. VERILOG WALKTHROUGH: topk_selector.v
+================================================================================
+
+v2's selector contains NO multiplier and no datapath arithmetic heavier
+than an increment: both products in its comparison arrive from the shared
+MAC. What remains is the decision predicate, the warmup override, and the
+counters.
+
+Ports: the three strobes (snap, rhs_ld, done), x_r, mean, mac_p, and
+warmup_active in; keep, out_valid, keep_count, index out.
+
+Stage 1 (at snap = welford's S_DEC -- statistics are PRE-update):
+  dx_pos_r <= ({x_r, 8'b0} > mean)   the dx > 0 guard from equation (2),
+                                     computed as a 16-bit UNSIGNED compare:
+                                     x<<8 and mean are both non-negative
+                                     Q8.8, so no subtraction and no sign
+                                     logic is needed for the sign test
+  warm_r   <= warmup_active
+
+Stage 2 (at rhs_ld = welford's S_MEAN):
+  rhs_r <= mac_p[31:0]               alpha^2 * variance < 2^32 (bound in
+                                     section 3), computed from the
+                                     pre-update variance
+
+Stage 3 (at done = welford's S_OUT -- mac_p now holds dx^2):
+  lhs = {4'b0, mac_p[32:0], 4'b0}    16 * dx^2  (<<4 as pure wiring)
+  rhs = {1'b0, rhs_r,       8'b0}    alpha^2 * (var << 8)  (<<8 likewise)
+  keep_next = warm_r | (dx_pos_r & (lhs > rhs))
+  keep <= keep_next; out_valid <= 1 (for exactly one cycle); index++;
+  keep_count += keep_next.
+
+The comparison is STRICT (an activation exactly at the threshold is
+skipped); the golden model implements the identical predicate. All outputs
+are registered -- pin values are glitch-free, and the decision cycle's
+critical path is just the 41-bit compare.
+
+
+================================================================================
+10. VERILOG WALKTHROUGH: tt_um_statistical_topk.v (TOP)
+================================================================================
+
+The top module is intentionally thin: config registers, edge detectors,
+the two submodule instances, and output packing. There is no protocol
+between the submodules -- welford_unit exposes its state, strobes, and the
+MAC product as wires and topk_selector consumes them, exactly like any
+hierarchical design; the "1x2 tiles" of the TT submission are purely a
+floorplan-area statement (tiles: 1x2 in info.yaml), not a physical
+partition.
+
+Config block:
+  alpha[3:0]      reset value 6 (alpha 1.5, ~6.7% Gaussian tail)
+  warmup_sel[1:0] reset value 2 (N = 64, K = 6)
+  in_valid_q, cfg_we_q: 1-flop histories for rising-edge detection.
+  On a cfg_we rising edge, alpha <= uio_in[5:2] and warmup_sel <=
+  uio_in[7:6], applied immediately: alpha is purely a comparison knob (safe
+  to change any time -- it affects only future decisions); a warmup_sel
+  change mid-stream changes K and N on the fly, which is benign because n
+  has usually saturated past every N (statistics are NOT reset by config
+  writes -- the demo relies on tuning alpha live against warm statistics).
+
+Edge detection rather than level sampling for in_valid: a rising-edge
+strobe works both for an MCU driving one clean pulse per byte and for a
+human on the demo board pressing a button (a held level is one sample, not
+one sample per clock). The FSM's accept-only-in-IDLE rule then defines the
+back-pressure contract: edges arriving mid-pass are dropped.
+
+Output packing (all registered or register-derived -- no combinational
+paths from input pins to output pins):
+  uo_out = {keep_count[3:0], clamp_sticky, warmup_active, out_valid, keep}
+
+uio is configured as all-inputs: uio_oe = 0, uio_out = 0, per TT convention
+for unused output paths. `ena` is ignored (TT guarantees it high when the
+design is selected); `index`, the keep counter's upper bits, and the
+exported variance bus are sunk into the _unused reduction to keep lint
+clean while remaining in the netlist for FPGA targets.
+
+
+================================================================================
+11. INTERFACE PROTOCOLS
+================================================================================
+
+SAMPLE STROBE (uio[0] = IN_VALID, ui[7:0] = activation):
+  1. Drive the activation byte on ui[7:0].
+  2. Raise IN_VALID (rising edge is what matters; drop it any time before
+     the next sample).
+  3. The edge is sampled on the next posedge clk; 57 clocks later OUT_VALID
+     (uo[1]) pulses for exactly one clock with KEEP (uo[0]) valid; KEEP
+     then holds its value until the next decision.
+  4. Minimum spacing between IN_VALID rising edges: 58 clocks (1 accept +
+     57 processing). Edges during a pass are ignored, not queued. A
+     saturated 3 Mbaud UART delivers a byte every ~83 clocks at 25 MHz, so
+     the pacing is automatic in the demo system.
+
+CONFIG WRITE (uio[1] = CFG_WE, uio[5:2] = ALPHA, uio[7:6] = WARMUP_SEL):
+  Drive the fields, raise CFG_WE; the values latch on the first posedge
+  after the rising edge. Takes effect on the next sample. Does not reset
+  statistics or counters. Reset defaults: alpha = 6, warmup_sel = 2.
+
+OUTPUT FLAG SEMANTICS:
+  WARMUP (uo[2]) is the LIVE n < N comparison. By the time a sample's
+  OUT_VALID pulses, that sample has already incremented n, so the flag
+  answers "will FUTURE samples still get warmup treatment?" -- it clears
+  during the out_valid cycle of warmup sample N (whose own decision was
+  still keep-all: keep-all covers the full N samples). It also reads 1
+  immediately after reset, before any sample. This post-update semantic is
+  deliberate: it is the correct "is the unit calibrated?" signal for a
+  driver, and it is what the golden model encodes ("warmup" in the step()
+  result; the pre-update view used for the decision itself is returned
+  separately as "warmup_used").
+  CLAMP (uo[3]): sticky defensive-clamp flag, 0 in all normal operation
+  (proofs, section 3); cleared only by reset.
+  KEEP_CNT (uo[7:4]): low nibble of the 16-bit keep counter -- enough to
+  verify liveness/keep-rate trends on pins; the full counter exists
+  internally and in FPGA builds.
+
+
+================================================================================
+12. VERIFICATION
+================================================================================
+
+Strategy: ONE golden model (sim/topk_model.py), bit-exact by construction,
+verified in two directions --
+  outward: analysis sweeps (section 13) show the model implements the
+           intended statistics;
+  inward:  the cocotb suite drives the RTL and the model with identical
+           stimulus and asserts equality on every observable output of
+           every sample: keep, warmup flag, clamp flag, keep-count nibble.
+Only TT-level pins are observed (no hierarchical references), so the
+identical suite runs against the post-layout gate-level netlist in CI.
+
+Crucially, the golden model is CYCLE-COUNT AGNOSTIC: it models values and
+update ordering, not timing. The v1 -> v2 microarchitecture swap (parallel
+multiplier, 4 cycles -> serial MAC, 57 cycles) required changing ONE
+constant in the testbench (the expected latency) and zero lines in the
+model -- the same 8 tests verify both microarchitectures bit-for-bit.
+
+The 8 cocotb tests (test/test.py), ~4,900 samples total, all passing:
+
+  1 test_reset_state             reset -> uo_out = 0x04 (warmup only),
+                                 uio all inputs
+  2 test_out_valid_timing        out_valid pulses exactly once, exactly 57
+                                 clocks after the in_valid edge
+  3 test_bitexact_gaussian_stream  2000 Gaussian samples, default config:
+                                 every output bit matches the model; keep
+                                 rate sanity-checked against theory
+  4 test_warmup_boundary_and_constant_stream  constant input: keep-all for
+                                 exactly 64 samples, keep-nothing after
+                                 (a constant stream has no upper tail);
+                                 warmup flag clears at the documented point
+  5 test_config_reconfiguration  live alpha/warmup rewrites mid-stream
+                                 (including extremes alpha=8, 15), still
+                                 bit-exact afterwards
+  6 test_extreme_inputs          800 samples of 0x00/0xFF spikes and
+                                 uniform noise: bit-exact, clamp stays 0
+                                 (exercises the P1-P3 corner conditions)
+  7 test_distribution_shift      mean jump 60 -> 160 mid-stream: bit-exact
+                                 through the transient, and the unit
+                                 resumes keeping (adaptation works)
+  8 test_busy_edge_ignored       an in_valid edge injected mid-pass
+                                 produces no extra decision AND no state
+                                 change (proved by continued bit-exactness
+                                 of a 200-sample stream afterwards)
+
+The serial MAC additionally has a standalone self-checking testbench in
+the repo (test/tb_mac.v: 9 directed corner products including 0, 1,
+65280^2, (2^24-1)*225, plus 500 random pairs; run instructions in its
+header and test/README.md).
+
+Two bugs this process caught in development, both instructive:
+
+  v1: the RTL's warmup pin showed the post-update n < N while the model
+  reported the pre-update view -- a one-sample discrepancy at exactly the
+  warmup boundary, invisible to eyeball testing, caught immediately by
+  bit-exact comparison. The pin semantics were kept (section 11) and the
+  model aligned.
+
+  v2: the rewritten variance update inlined {4'b0, variance} directly into
+  the update expression. Verilog concatenations are UNSIGNED, and one
+  unsigned operand flips the entire expression context to unsigned --
+  silently turning `diff >>> s` from an arithmetic shift into a logical
+  one. The corruption only manifests when diff is negative (variance
+  decreasing), so a constant-input test passes and a varying stream fails:
+  the suite flagged a sticky-clamp mismatch within 5 samples of the first
+  variance decrease, and an internal trace pinned var_upd = 33,702,258
+  where the model said 147,826 -- exactly the logical-shift value. The fix
+  (and the rule now stated in the RTL comments): every operand in a signed
+  arithmetic expression is DECLARED signed; no bare concatenations inside
+  arithmetic. This is the textbook Verilog signedness trap, caught by
+  bit-exact differential testing in seconds.
+
+
+================================================================================
+13. SIMULATION RESULTS (sim/run_analysis.py -> sim/analysis_output.txt)
+================================================================================
+
+Keep rate vs alpha, Gaussian(80,25) input, 60k samples/point:
+    alpha_reg  alpha  measured   theory (1-sided tail)
+        4      1.00    16.25%    15.87%
+        5      1.25    10.97%    10.56%
+        6      1.50     7.07%     6.68%     <- reset default
+        7      1.75     4.25%     4.01%
+        8      2.00     2.43%     2.28%
+  Fixed-point silicon tracks closed-form Gaussian theory within ~0.4
+  percentage points across the whole configurable range; the small
+  systematic excess is EMA estimator noise against a convex tail.
+
+Warmup convergence (mean |threshold error|, 20 trials): 15.0 at 8 samples,
+  8.2 at 16, 5.5 at 32, 4.1 at 64, then a slow noise-floor decay (2.8 at
+  128). Plateau ~64 samples -> default N = 64, K = 6.
+
+Distribution shift (mu 60 -> 120 at sample 5000, target threshold 150):
+  86.9 immediately before; 151.1 one window (64 samples) after; settled
+  ~148-152 thereafter. Live adaptation with no reset or recalibration.
+
+Fixed-point vs float Welford (60k samples, time-averaged): mean error
+  0.136 LSB of x, variance error 4.6 on 623.9 (0.7%).
+
+ReLU(N(0,60)) "lazy neuron" streams: alpha_reg 5/6/7/8 -> keep rates
+  13.2% / 10.3% / 8.1% / 6.3%. The Spark paper's ~8% operating point
+  corresponds to alpha_reg = 7 on this distribution shape; the 4-bit alpha
+  register brackets it with room on both sides.
+
+(These numbers are properties of the fixed-point ALGORITHM, verified
+bit-exact in RTL; they are identical for v1 and v2 by construction.)
+
+
+================================================================================
+14. SYNTHESIS RESULTS, THE V1 -> V2 AREA STORY, AND THE TILE BUDGET
+================================================================================
+
+The tile budget was not designed on paper -- it was measured, twice.
+
+v1 (our earlier version): one parallel 18x18 multiplier shared between
+two products, plus a parallel 8x32 for the decision RHS.
+  yosys generic gates:     4,832  (6,631 before the multiplier sharing)
+  GDS flow, sky130A:       ~4,215 movable std cells, 41.1k um^2 synth area,
+                           45.7k um^2 incl. pin-density adjust
+  1x2 core (34.3k um^2):   138% utilization -> GPL-0301, DOES NOT FIT
+  2x2 core (72.6k um^2):   placed at 67.3%, routed clean (0 DRC/LVS),
+                           +5.5 ns worst-corner setup slack at 25 MHz
+  Lesson: the multiplier-dominated netlist mapped nearly 1:1 from generic
+  gates instead of the assumed ~30% shrink -- wide XOR/AND partial-product
+  trees do not collapse into complex sky130 cells the way control logic
+  does. Profiling the layout: ~77% of stdcell area was combinational, and
+  the two multiplier arrays dominated it.
+
+v2 (this version): every product through one radix-2 serial MAC.
+  yosys generic gates:     2,062  (-57% vs v1; -69% vs the naive version)
+  what was removed:        the 18x18 partial-product array, the 8x32
+                           partial-product array, the 40-bit LHS holding
+                           register, the selector's variance snapshot
+  what was added:          a 41-bit shift register, a 25-bit adder, a
+                           5-bit counter, operand muxes, 5 FSM states
+                           (v1's four grew to nine)
+  what it cost:            53 extra clocks of latency per sample -- unobservable
+                           behind the 83-clock UART byte period
+
+v2 final signoff (successful CI harden on 1x2, LibreLane 3.0.3 / sky130A):
+
+  standard cells:          2,492 placed  (v1: 5,772 on 2x2 -- -57%)
+  stdcell area:            22.1k um^2 in the 34.3k um^2 1x2 core
+  utilization:             64.5%   (v1 needed 138% of this same core)
+  setup WNS, worst corner:   +17.1 ns   (typical corner: +25.4 ns)
+  hold WNS, worst corner:    +0.11 ns
+  routing DRC / magic DRC / LVS errors: 0 / 0 / 0
+  gate-level test:         all 8 cocotb tests pass on the routed netlist
+  flow notes:              residual ss-corner max-slew warnings (630, down
+                           from v1's 954; non-fatal, covered by the margin)
+
+Timing, as predicted: the serial MAC's critical path is a 25-bit add
+feeding a register -- far shorter than v1's 18x18 array. Worst-corner
+setup margin went from v1's +5.5 ns to +17.1 ns in the same 40 ns period.
+(Precision about what that does and does not prove: the as-built worst-
+corner path is 40 - 17.1 = 22.9 ns, so this exact netlist would miss a
+20 ns period by ~3 ns at the ss corner. Under a real 50 MHz constraint the
+resizer would work the paths harder and would plausibly close it -- but
+that is untested, and section 15 explains why it never will be.)
+
+
+================================================================================
+15. DESIGN DECISIONS AND ALTERNATIVES CONSIDERED
+================================================================================
+
+Serial MAC vs parallel multiplier (the v1 -> v2 decision): a parallel
+multiplier is the right call when multiplies bound throughput; here the
+UART bounds throughput at ~1/20th of even v1's decision rate (300k
+bytes/s vs 6.25M decisions/s at 25 MHz), so v1's
+parallel array was pure area spent on unused speed. The serial MAC trades
+53 clocks nobody can observe for a 57% gate reduction and half the tiles.
+Radix-4 Booth recoding was considered (halves iterations to 9) and
+rejected: it reintroduces signed-digit selection logic and a wider adder
+for a latency improvement with zero system-level value.
+
+Fixed 17 iterations vs early termination / per-op counts: variable latency
+would complicate the protocol contract (out_valid timing becomes data-
+dependent) and save cycles that, again, have no value. Uniform iteration
+count keeps the sequencer trivial and the latency deterministic.
+
+Unsigned MAC on magnitudes vs signed MAC: proof P2 guarantees the only
+signed product in the algorithm is non-negative with same-sign operands,
+so magnitudes lose nothing; the unsigned engine drops sign-extension from
+the iteration loop and the |.| conversions are two 17-bit negate-muxes.
+
+Product ordering in the sequencer (RHS -> M2 -> dx^2): RHS must read
+pre-update variance, so it goes before S_VAR; dx^2 goes LAST so the
+decision can consume it directly from the MAC's product register --
+deleting v1's 40-bit LHS holding register. The M2 product slots between,
+right after |delta2| becomes available. Three orderings were valid; this
+one minimizes registers.
+
+EMA-Welford vs true 1/n Welford: true Welford needs division by arbitrary
+n (a divider, or a reciprocal LUT + multiply). The power-of-2 schedule
+keeps Welford's exact update STRUCTURE (both deviations, the delta*delta2
+increment) while making every divide free, and its EMA tail is a feature:
+FFN activation statistics drift across prompts/layers, and an
+infinite-window estimator would fossilize. The cost is estimator noise
+(~2 LSB threshold wobble) -- measured to move keep rates <0.5pp.
+
+Sum-of-squares (E[x^2] - E[x]^2) vs M2 form: naive sum-of-squares with
+power-of-2 windows would also work in exact integer arithmetic, but its
+running sums grow with window length (the 32-bit-overflow-at-65k-samples
+problem) and a windowed restart forfeits continuous adaptation. The M2/EMA
+form stores only bounded state (proof P3) and never restarts.
+
+Predict-then-update vs update-then-predict: deciding with pre-update stats
+means a sample never lowers its own bar (a huge outlier inflates var only
+for its successors). Either choice is defensible; this one is standard in
+online learning and locked in by the golden model. In v2 it additionally
+dictates the product ordering (above).
+
+Keep-all warmup vs keep-none / threshold-anyway: dropping activations on
+garbage statistics silently corrupts downstream computation; keeping
+everything costs only lost sparsity for 64 samples. Conservative wins.
+
+Strict vs non-strict threshold compare: x exactly at threshold is skipped
+(lhs > rhs, not >=). With 41-bit operands, exact ties are measure-zero in
+practice; what matters is that model and RTL agree, which is tested.
+
+Sign guard as unsigned compare: dx > 0 is computed as (x<<8) > mean on
+unsigned Q8.8 values -- a 16-bit comparator instead of consuming the
+18-bit subtract's sign; the selector needs no subtractor at all.
+
+25 MHz vs reclaiming 50 MHz: v1 missed the slow corner at 50 MHz by 4.5 ns
+through its parallel multiplier; v2's shorter paths would likely close
+50 MHz. Not attempted: doubling the clock buys decision throughput the
+UART cannot use, costs another hardening iteration to validate, and
+halving the cycle budget helps nothing -- 57 clocks at 25 MHz already beats
+the byte period. The constraint stays at the proven 40 ns.
+
+Counter nibble on pins vs full bus: TT gives 8 output pins; keep + valid +
+warmup + clamp leaves 4. The keep-count low nibble is enough to watch keep-
+rate trends and verify liveness externally; the full 16-bit counters exist
+internally (and on FPGA builds).
+
+Synchronous reset: TT's flow and sky130's DFF library handle a fully
+synchronous active-low reset most simply (no recovery/removal timing, no
+reset-domain crossing), and every register having a reset value makes the
+gate-level sim (X at t=0) settle deterministically -- a requirement for the
+pin-only GL test reuse.
+
+All-input uio configuration: the config/strobe pins consume 8 inputs; the
+alternative (time-multiplexed config over fewer pins) buys pins this design
+has no use for, at real protocol cost. uio_oe is hardwired 0, which also
+sidesteps every output-enable/contention hazard class in TT integration.
+
+
+================================================================================
+16. THE DEMO PIPELINE
+================================================================================
+
+demo/llama_stream_demo.py (see demo/README.md for wiring):
+
+  HuggingFace model (e.g. TinyLlama)
+      |  register_forward_hook on every layer's FFN activation module
+      v
+  float activations -> per-tensor min-max quantization to uint8
+      |
+      v                                    +-- --mock: the golden model
+  transport --------------------------------|         (bit-exact, no hw)
+      |                                    +-- --port: UART bridge -> chip
+      v
+  keep/skip mask -> applied to the live tensor (skipped neurons zeroed)
+      |
+      v
+  metrics: keep rate overall/per layer; dense-vs-sparse next-token
+  prediction agreement and probability L1 -- the "near-zero degradation at
+  ~8% keep" claim, measured end to end with the selection made in silicon.
+
+The synthetic mode (default, zero dependencies) replays the section-13
+experiments through the same transport abstraction, so the full host stack
+is exercised without torch/transformers installed. Measured on this
+machine: Gaussian 7.0% keep at alpha 1.5 (theory 6.68%); ReLU-Gaussian
+10.3%; post-shift re-adaptation to 7.0% -- consistent with the 60k-sample
+sweeps of section 13, as they must be (same model, same arithmetic).
+
+The UART protocol reserves 0xFF as an escape for config frames (data 0xFF
+clamps to 0xFE -- a 1-LSB error on the single fully-saturated code, chosen
+over a 2-byte stuffing protocol that would halve the link's worst-case
+throughput). Chip-side pacing is automatic: a byte arrives every ~83
+clocks and a decision takes 57.
+
+
+================================================================================
+17. REFERENCES
+================================================================================
+
+  Spark Transformer: reactivating sparsity in FFN and attention.
+      arXiv:2506.06644 (NeurIPS 2025). Section 3 defines statistical top-k;
+      this design implements it per-activation in hardware.
+  Welford, B.P. (1962). Note on a method for calculating corrected sums of
+      squares and products. Technometrics 4(3). The M2 update structure.
+  embeddedrelated.com/showarticle/785.php -- fixed-point online variance;
+      informed the Q-format and truncation-bias analysis.
+  Tiny Tapeout documentation (tinytapeout.com) -- pin budget, clocking,
+      multi-tile info.yaml, GL test flow.
+  ITA (arXiv:2307.03493, ETH Zurich) -- closest prior open ML-primitive
+      silicon (streaming softmax at 22nm); the area/timing reporting
+      structure here follows its example. Different operation, different
+      PDK: no prior open-source statistical top-k / activation-statistics
+      silicon exists on any open PDK to the author's knowledge.
+================================================================================
